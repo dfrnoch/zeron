@@ -1313,6 +1313,9 @@ fn forward_deadline(method: &str) -> std::time::Duration {
             Duration::from_secs(15 * 60)
         }
         methods::INSTALL_HARNESS => Duration::from_secs(15 * 60),
+        // manifest.json, then the latest.txt fallback, each under the
+        // release-metadata deadline.
+        methods::CHECK_UPDATE => Duration::from_secs(150),
         // A full fleet of enabled providers is checked two at a time; each
         // provider may need both a CLI probe and a network request.
         methods::CHECK_HARNESS_UPDATES => Duration::from_secs(4 * 60),
@@ -1418,6 +1421,7 @@ fn forwardable(method: &str) -> bool {
             | methods::READ_ATTACHMENT_CHUNK
             // Updates report/apply on the device whose binary they concern.
             | methods::UPDATE_STATUS
+            | methods::CHECK_UPDATE
             | methods::APPLY_UPDATE
             | methods::WATCH_HARNESS_UPDATES
             | methods::CHECK_HARNESS_UPDATES
@@ -2327,6 +2331,14 @@ impl RpcService for EngineRpc {
                 ))))
             }
             methods::UPDATE_STATUS => Ok(RpcReply::Stream(watch_stream(self.updater()?.watch()))),
+            methods::CHECK_UPDATE => {
+                let status = self
+                    .updater()?
+                    .check()
+                    .await
+                    .map_err(|e| RpcError::Failed(format!("{e:#}")))?;
+                RpcReply::value(&status)
+            }
             methods::APPLY_UPDATE => {
                 let version = self
                     .updater()?

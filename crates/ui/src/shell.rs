@@ -102,6 +102,7 @@ actions!(
         OpenModelPicker,
         NewSession,
         OpenSettings,
+        CheckForUpdates,
         NextSession,
         PrevSession,
         ArchiveSession
@@ -1348,6 +1349,16 @@ enum UpdateFlow {
     Failed(SharedString),
 }
 
+/// A user-initiated release check (Settings → General → Updates, the app
+/// menu's "Check for Updates…"). The result itself lands in
+/// `AppState::update`, like the background checker's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UpdateCheck {
+    Idle,
+    Checking,
+    Failed(SharedString),
+}
+
 /// Account lifecycle owned by this process. Sign-in on a local workspace
 /// flows through the in-place switch wizard (offer → switch → import → done);
 /// `RestartPending` survives only as the fallback when the in-place swap
@@ -1925,6 +1936,8 @@ pub struct Shell {
     /// Version whose update strip the user dismissed (advisory installs only —
     /// a newer release shows the strip again).
     update_dismissed: Option<String>,
+    update_check: UpdateCheck,
+    update_check_task: Option<Task<()>>,
     /// How this binary was installed — decides the strip's click behavior.
     /// Cached: `detect_install` stats `current_exe` and this renders per frame.
     install: zeron_update::InstallKind,
@@ -2337,6 +2350,8 @@ impl Shell {
             update_flow: UpdateFlow::Idle,
             update_task: None,
             update_dismissed: None,
+            update_check: UpdateCheck::Idle,
+            update_check_task: None,
             install: zeron_update::detect_install(),
             org: None,
             sync_flow: SyncFlow::Idle,
@@ -4770,6 +4785,14 @@ impl Shell {
                         &page,
                         |this: &mut Shell, _, event: &ShortcutsEvent, cx| {
                             match event {
+                                ShortcutsEvent::CheckForUpdates => {
+                                    this.check_for_updates(cx);
+                                    return;
+                                }
+                                ShortcutsEvent::InstallUpdate => {
+                                    this.take_update_step(cx);
+                                    return;
+                                }
                                 ShortcutsEvent::KeymapChanged(keymap) => {
                                     this.settings.keymap = keymap.clone();
                                 }
@@ -4802,13 +4825,15 @@ impl Shell {
                     ));
                     self.shortcuts_page = Some(page);
                 }
+                let updates = self.updates_view(cx);
                 match &self.shortcuts_page {
                     Some(page) => {
-                        page.update(cx, |page, _| {
+                        page.update(cx, |page, cx| {
                             page.show_section(
                                 section == SettingsSection::Appshots,
                                 section == SettingsSection::General,
-                            )
+                            );
+                            page.set_updates(updates, cx);
                         });
                         page.clone().into_any_element()
                     }
@@ -8130,10 +8155,157 @@ impl Shell {
             cx.notify();
             return;
         }
+        self.advance_desktop_update(cx);
+    }
+
+    fn advance_desktop_update(&mut self, cx: &mut Context<Self>) {
         match std::mem::replace(&mut self.update_flow, UpdateFlow::Idle) {
             UpdateFlow::Idle | UpdateFlow::Failed(_) => self.begin_update_download(cx),
             UpdateFlow::Downloading => self.update_flow = UpdateFlow::Downloading,
             UpdateFlow::Ready(staged) => self.apply_staged_update(staged, cx),
+        }
+    }
+
+    /// Settings → General → Updates' primary button. Same flow as the strip,
+    /// except the advisory case only opens the releases page — the card is
+    /// not something to dismiss.
+    fn take_update_step(&mut self, cx: &mut Context<Self>) {
+        let available = self
+            .state
+            .read(cx)
+            .update
+            .as_ref()
+            .is_some_and(|status| status.update_available);
+        if !available {
+            return;
+        }
+        if self.install.supports_desktop_update() {
+            self.advance_desktop_update(cx);
+        } else if matches!(self.install, zeron_update::InstallKind::Unmanaged) {
+            cx.open_url(zeron_update::RELEASES_PAGE);
+        }
+    }
+
+    /// Ask the engine to check for a release now; its reply (also published
+    /// on the UpdateStatus stream) updates the strip and the Updates card. An
+    /// engine that predates `CheckUpdate`, or none at all yet, falls back to
+    /// fetching the release metadata from here.
+    fn check_for_updates(&mut self, cx: &mut Context<Self>) {
+        if self.update_check == UpdateCheck::Checking {
+            return;
+        }
+        let engine = self.state.read(cx).engine().cloned();
+        let edge_url = self.boot.edge_url.clone();
+        self.update_check = UpdateCheck::Checking;
+        self.update_check_task = Some(cx.spawn(async move |this, cx| {
+            let via_engine = match &engine {
+                Some(engine) => Some(
+                    engine
+                        .client()
+                        .call_as::<zeron_update::UpdateStatus>(
+                            methods::CHECK_UPDATE,
+                            serde_json::json!({}),
+                        )
+                        .await,
+                ),
+                None => None,
+            };
+            let outcome = match via_engine {
+                Some(Ok(status)) => Ok(status),
+                Some(Err(zeron_rpc::RpcError::UnknownMethod(_))) | None => {
+                    let fetch = Tokio::spawn_result(cx, async move {
+                        zeron_update::fetch_latest(&edge_url).await
+                    });
+                    match fetch.await {
+                        Ok(manifest) => {
+                            let current = zeron_update::current_version();
+                            Ok(zeron_update::UpdateStatus {
+                                current_version: current.to_owned(),
+                                update_available: zeron_update::version_newer(
+                                    &manifest.version,
+                                    current,
+                                ),
+                                latest_version: Some(manifest.version),
+                                checked_at: Some(Utc::now().timestamp_millis()),
+                                error: None,
+                            })
+                        }
+                        Err(err) => Err(format!("{err:#}")),
+                    }
+                }
+                Some(Err(err)) => Err(err.to_string()),
+            };
+            this.update(cx, |shell, cx| {
+                shell.update_check = match outcome {
+                    Ok(status) => {
+                        // Asking again brings back a strip dismissed for
+                        // this version.
+                        if status.update_available {
+                            shell.update_dismissed = None;
+                        }
+                        shell.state.update(cx, |state, cx| {
+                            state.apply_update(status);
+                            cx.notify();
+                        });
+                        UpdateCheck::Idle
+                    }
+                    Err(message) => {
+                        tracing::warn!(%message, "update check failed");
+                        UpdateCheck::Failed(message.into())
+                    }
+                };
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    /// The Updates card's next step — the card's reading of the same states
+    /// as [`Self::update_strip_label`].
+    fn update_step(
+        install: &zeron_update::InstallKind,
+        flow: &UpdateFlow,
+    ) -> settings::updates::UpdateStep {
+        use settings::updates::UpdateStep;
+        if install.supports_desktop_update() {
+            match flow {
+                UpdateFlow::Idle => UpdateStep::Download,
+                UpdateFlow::Downloading => UpdateStep::Downloading,
+                UpdateFlow::Ready(_) => UpdateStep::Restart,
+                UpdateFlow::Failed(message) => UpdateStep::Retry(message.clone()),
+            }
+        } else if matches!(install, zeron_update::InstallKind::Managed { .. }) {
+            UpdateStep::RunCli
+        } else {
+            UpdateStep::OpenReleases
+        }
+    }
+
+    /// The Updates card's snapshot of everything above.
+    fn updates_view(&self, cx: &App) -> settings::updates::UpdatesView {
+        use settings::updates::UpdatesView;
+        let status = self.state.read(cx).update.clone();
+        let update_available = status.as_ref().is_some_and(|s| s.update_available);
+        let step = update_available.then(|| Self::update_step(&self.install, &self.update_flow));
+        UpdatesView {
+            current_version: status
+                .as_ref()
+                .map(|s| s.current_version.clone())
+                .unwrap_or_else(|| zeron_update::current_version().to_owned())
+                .into(),
+            latest_version: status
+                .as_ref()
+                .and_then(|s| s.latest_version.clone())
+                .map(Into::into),
+            update_available,
+            checked_at: status.as_ref().and_then(|s| s.checked_at),
+            checking: self.update_check == UpdateCheck::Checking,
+            error: match &self.update_check {
+                UpdateCheck::Failed(message) => Some(message.clone()),
+                _ => None,
+            },
+            step,
         }
     }
 
@@ -12066,6 +12238,12 @@ impl Render for Shell {
             // Native Settings menu item and the platform convention (Cmd+, on
             // macOS, Ctrl+, elsewhere) toggle the modal from any section.
             .on_action(cx.listener(|this, _: &OpenSettings, _, cx| this.toggle_settings(cx)))
+            // The app menu's "Check for Updates…": show the Updates card so the
+            // check's progress and result have somewhere to land.
+            .on_action(cx.listener(|this, _: &CheckForUpdates, _, cx| {
+                this.open_settings(SettingsSection::General, cx);
+                this.check_for_updates(cx);
+            }))
             .on_action(cx.listener(|this, _: &NextSession, window, cx| {
                 this.cycle_navigation(true, window, cx)
             }))
@@ -12639,6 +12817,44 @@ mod tests {
         assert_eq!(
             Shell::update_strip_label(&mac_app, &UpdateFlow::Idle, "0.2.86").0,
             SharedString::from("Update available — v0.2.86")
+        );
+    }
+
+    #[test]
+    fn updates_card_steps_cover_every_install_kind() {
+        use crate::settings::updates::UpdateStep;
+        let managed = zeron_update::InstallKind::Managed {
+            app_root: PathBuf::from("/home/u/.zeron/app"),
+        };
+        assert_eq!(
+            Shell::update_step(&managed, &UpdateFlow::Idle),
+            UpdateStep::RunCli
+        );
+        assert_eq!(
+            Shell::update_step(&zeron_update::InstallKind::Unmanaged, &UpdateFlow::Idle),
+            UpdateStep::OpenReleases
+        );
+        let mac_app = zeron_update::InstallKind::MacApp {
+            bundle: PathBuf::from("/Applications/Zeron.app"),
+        };
+        assert_eq!(
+            Shell::update_step(&mac_app, &UpdateFlow::Idle),
+            UpdateStep::Download
+        );
+        assert_eq!(
+            Shell::update_step(&mac_app, &UpdateFlow::Downloading),
+            UpdateStep::Downloading
+        );
+        assert_eq!(
+            Shell::update_step(
+                &mac_app,
+                &UpdateFlow::Ready(PathBuf::from("/tmp/Zeron.app"))
+            ),
+            UpdateStep::Restart
+        );
+        assert_eq!(
+            Shell::update_step(&mac_app, &UpdateFlow::Failed("offline".into())),
+            UpdateStep::Retry("offline".into())
         );
     }
 

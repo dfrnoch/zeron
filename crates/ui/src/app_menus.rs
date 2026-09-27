@@ -166,6 +166,9 @@ pub fn app_menus() -> Vec<Menu> {
     let mut app_items = vec![
         // The native AppKit about panel; no equivalent elsewhere yet.
         MenuItem::action("About Zeron", About).disabled(!macos),
+        // Handled by the shell: opens Settings → General's Updates card and
+        // checks there, so progress and the result stay visible.
+        MenuItem::action("Check for Updates…", shell::CheckForUpdates),
         MenuItem::separator(),
         MenuItem::action("Settings", shell::OpenSettings),
         MenuItem::separator(),
@@ -258,6 +261,16 @@ mod tests {
             )),
             "the application menu should expose Settings"
         );
+    }
+
+    #[test]
+    fn app_menu_offers_check_for_updates_after_about() {
+        let menus = app_menus();
+        let Some(MenuItem::Action { name, action, .. }) = menus[0].items.get(1) else {
+            panic!("second app-menu item must be an action");
+        };
+        assert_eq!(name.as_ref(), "Check for Updates…");
+        assert_eq!(action.name(), shell::CheckForUpdates.name());
     }
 
     #[test]

@@ -785,6 +785,24 @@ impl Updater {
             .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
     }
 
+    /// Check right now and return the fresh status — the user-initiated "Check
+    /// for Updates" path. Also publishes on the watch channel, so every
+    /// `UpdateStatus` subscriber (the sidebar strip) sees the result. The
+    /// background cadence is left alone.
+    pub async fn check(&self) -> anyhow::Result<UpdateStatus> {
+        let ok = self.check_once().await;
+        let status = self.status_tx.borrow().clone();
+        if ok {
+            Ok(status)
+        } else {
+            Err(anyhow::anyhow!(
+                status
+                    .error
+                    .unwrap_or_else(|| "update check failed".to_owned())
+            ))
+        }
+    }
+
     fn quiescent_now(&self) -> bool {
         self.quiescent.as_ref().is_none_or(|check| check())
     }

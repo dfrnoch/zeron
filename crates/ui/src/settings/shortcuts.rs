@@ -54,6 +54,11 @@ pub enum ShortcutsEvent {
         sound_enabled: bool,
         destination: AppshotDestination,
     },
+    /// Settings → General → Updates: check for a release now.
+    CheckForUpdates,
+    /// Settings → General → Updates: take the offered next step (download,
+    /// restart into the staged update, or open the releases page).
+    InstallUpdate,
 }
 
 pub struct ShortcutsPage {
@@ -82,6 +87,8 @@ pub struct ShortcutsPage {
     semantic_access_prompted: bool,
     /// Settings → General's thread naming card (its own title-bound picker).
     thread_naming: Entity<crate::settings::thread_naming::ThreadNamingCard>,
+    /// Settings → General's updates card, pushed by the shell each frame.
+    updates: crate::settings::updates::UpdatesView,
     _state: Entity<AppState>,
 }
 
@@ -125,6 +132,7 @@ impl ShortcutsPage {
                 let state = state.clone();
                 cx.new(|cx| crate::settings::thread_naming::ThreadNamingCard::new(state, cx))
             },
+            updates: Default::default(),
             _state: state,
         }
     }
@@ -146,6 +154,17 @@ impl ShortcutsPage {
             if appshots {
                 self.appshot_capabilities = crate::appshots::capabilities();
             }
+        }
+    }
+
+    pub fn set_updates(
+        &mut self,
+        updates: crate::settings::updates::UpdatesView,
+        cx: &mut Context<Self>,
+    ) {
+        if self.updates != updates {
+            self.updates = updates;
+            cx.notify();
         }
     }
 
@@ -655,7 +674,12 @@ impl Render for ShortcutsPage {
                                             .child(compact_mode_row)
                                             .child(escape_behavior_row),
                                     )
-                                    .child(self.thread_naming.clone()),
+                                    .child(self.thread_naming.clone())
+                                    .child(crate::settings::updates::render(
+                                        &self.updates,
+                                        &theme,
+                                        cx,
+                                    )),
                             ),
                     )
                     .fade_overflow_y(&self.scroll.scroll),

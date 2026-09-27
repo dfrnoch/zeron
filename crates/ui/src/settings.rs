@@ -26,6 +26,7 @@ pub mod harnesses;
 pub mod notifications;
 pub mod shortcuts;
 pub mod thread_naming;
+pub mod updates;
 pub mod widgets;
 
 /// Sidebar drag-resize bounds (px).
