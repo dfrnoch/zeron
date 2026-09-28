@@ -4,8 +4,9 @@
 //! canvas, keyed per space) and restored on return (emulators — and their
 //! server-side PTYs — survive navigation; detach is not close). Tab bar
 //! supports pointer drag-reorder with 150 ms sliding transforms, middle-click
-//! close, and a "+" new-tab button; Cmd/Ctrl+J toggles the panel (the shell
-//! owns the height animation + persistence).
+//! close, a "+" new-tab button, and a per-chat side-by-side layout. A single
+//! terminal hides its tab while keeping the toolbar available. Cmd/Ctrl+J
+//! toggles the panel (the shell owns the height animation + persistence).
 //!
 //! Data path per tab: `OpenTerminal` → `SubscribeTerminal` stream; Data frames
 //! (base64) feed the [`Emulator`]; query responses write back; the stream
@@ -262,6 +263,7 @@ struct TerminalTab {
     terminal_id: Option<String>,
     target_device_id: Option<String>,
     emulator: Emulator,
+    geometry: Option<GridGeometry>,
     exited: Option<i32>,
     last_seq: u64,
     coalescer: InputCoalescer,
@@ -275,6 +277,7 @@ struct TerminalTab {
 struct ChatTabs {
     tabs: Vec<TerminalTab>,
     active: usize,
+    side_by_side: bool,
 }
 
 /// Drag-reorder state; `epoch` keys the 150 ms slide animation restarts.
@@ -341,8 +344,6 @@ pub struct TerminalPanel {
     tab_seq: u64,
     drag: Option<DragState>,
     last_selected: Option<String>,
-    /// Last reported grid placement; `None` until the first prepaint.
-    geometry: Option<GridGeometry>,
     /// Left-button gesture in flight, if any.
     selection_drag: Option<SelectionDrag>,
     /// One-shot timer rescheduled only while a live selection remains in an
@@ -375,7 +376,6 @@ impl TerminalPanel {
             tab_seq: 0,
             drag: None,
             last_selected: None,
-            geometry: None,
             selection_drag: None,
             selection_scroll_task: None,
             rail_tab_key: None,
@@ -490,6 +490,7 @@ impl TerminalPanel {
             terminal_id: None,
             target_device_id: None,
             emulator: Emulator::new(80, 24),
+            geometry: None,
             exited: None,
             last_seq: 0,
             coalescer: InputCoalescer::default(),
@@ -498,6 +499,8 @@ impl TerminalPanel {
             _run: None,
         });
         entry.active = entry.tabs.len() - 1;
+        self.selection_drag = None;
+        self.selection_scroll_task = None;
         cx.notify();
         key
     }
@@ -576,6 +579,8 @@ impl TerminalPanel {
         if switched {
             self.last_selected = Some(selected_key.clone());
             self.drag = None;
+            self.selection_drag = None;
+            self.selection_scroll_task = None;
         }
         if self.open && !self.embedded {
             // Returning to a chat with tabs restores them; a fresh chat (or an
@@ -985,24 +990,21 @@ impl TerminalPanel {
 
     /// Called from element prepaint with the frame's grid placement. Resizes
     /// the emulator immediately; the `ResizeTerminal` RPC debounces 80 ms.
-    pub fn on_grid_metrics(&mut self, geometry: GridGeometry, cx: &mut Context<Self>) {
+    pub fn on_grid_metrics(&mut self, key: u64, geometry: GridGeometry, cx: &mut Context<Self>) {
         // Stash unconditionally, before the early returns below: pointer
         // mapping needs the placement even on frames where nothing resized,
         // which is almost all of them.
-        self.geometry = Some(geometry);
-        if self.resize_suspended {
+        let chat = self.selected_chat(cx);
+        let engine = self.engine(cx);
+        let resize_suspended = self.resize_suspended;
+        let Some(tab) = self.tab_mut(&chat, key) else {
+            return;
+        };
+        tab.geometry = Some(geometry);
+        if resize_suspended {
             return;
         }
         let (cols, rows) = (geometry.cols, geometry.rows);
-        let chat = self.selected_chat(cx);
-        let engine = self.engine(cx);
-        let Some(tabs) = self.chats.get_mut(&chat) else {
-            return;
-        };
-        let active = tabs.active;
-        let Some(tab) = tabs.tabs.get_mut(active) else {
-            return;
-        };
         if tab.emulator.cols() == cols as usize && tab.emulator.rows() == rows as usize {
             return;
         }
@@ -1045,8 +1047,14 @@ impl TerminalPanel {
     }
 
     /// Snapshot for the paint element.
-    pub fn active_grid_snapshot(&self, cx: &App) -> Option<GridSnapshot> {
-        let tab = self.active_tab(cx)?;
+    pub fn grid_snapshot(&self, key: u64, cx: &App) -> Option<GridSnapshot> {
+        let chat = self.selected_chat(cx);
+        let tab = self
+            .chats
+            .get(&chat)?
+            .tabs
+            .iter()
+            .find(|tab| tab.key == key)?;
         Some(GridSnapshot {
             lines: tab.emulator.lines(),
             cursor: tab.emulator.cursor(),
@@ -1074,7 +1082,7 @@ impl TerminalPanel {
         position: gpui::Point<Pixels>,
         cx: &App,
     ) -> Option<(GridPoint, Side)> {
-        let geometry = self.geometry?;
+        let geometry = self.active_tab(cx)?.geometry?;
         let hit = cell_at(
             f32::from(position.x - geometry.origin.x),
             f32::from(position.y - geometry.origin.y),
@@ -1234,7 +1242,10 @@ impl TerminalPanel {
         if self.selection_scroll_task.is_some() {
             return;
         }
-        let (Some(drag), Some(geometry)) = (self.selection_drag, self.geometry) else {
+        let (Some(drag), Some(geometry)) = (
+            self.selection_drag,
+            self.active_tab(cx).and_then(|tab| tab.geometry),
+        ) else {
             return;
         };
         if !drag.armed || selection_scroll_lines(geometry, drag.position) == 0 {
@@ -1252,7 +1263,10 @@ impl TerminalPanel {
     }
 
     fn step_selection_scroll(&mut self, cx: &mut Context<Self>) {
-        let (Some(drag), Some(geometry)) = (self.selection_drag, self.geometry) else {
+        let (Some(drag), Some(geometry)) = (
+            self.selection_drag,
+            self.active_tab(cx).and_then(|tab| tab.geometry),
+        ) else {
             return;
         };
         if !drag.armed {
@@ -1301,8 +1315,8 @@ impl TerminalPanel {
     /// terminal body) and the scroll position in px from the top of the
     /// scrollback.
     fn rail_frame(&self) -> Option<(MenuScrollbarMetrics, Pixels, f32)> {
-        let geometry = self.geometry?;
         let tab = self.rail_tab()?;
+        let geometry = tab.geometry?;
         let (viewport, content, offset) = rail_parts(
             geometry.line_h,
             tab.emulator.rows(),
@@ -1320,7 +1334,11 @@ impl TerminalPanel {
     /// fraction of the scrollback from the TOP; the emulator's scroll-to API
     /// takes lines from the live bottom.
     fn apply_rail_drag(&mut self, pointer_y: Pixels) -> bool {
-        let Some(line_h) = self.geometry.map(|geometry| geometry.line_h) else {
+        let Some(line_h) = self
+            .rail_tab()
+            .and_then(|tab| tab.geometry)
+            .map(|geometry| geometry.line_h)
+        else {
             return false;
         };
         let Some((metrics, track_top, _)) = self.rail_frame() else {
@@ -1360,6 +1378,8 @@ impl TerminalPanel {
             && tabs.active != ix
         {
             tabs.active = ix;
+            self.selection_drag = None;
+            self.selection_scroll_task = None;
             cx.notify();
         }
     }
@@ -1377,6 +1397,8 @@ impl TerminalPanel {
         tabs.active = active_after_close(tabs.active, ix, tabs.tabs.len());
         let now_empty = tabs.tabs.is_empty();
         self.drag = None;
+        self.selection_drag = None;
+        self.selection_scroll_task = None;
         // Closing the LAST terminal closes the drawer too — an empty dock is
         // dead space (user request). Same path as the collapse chevron.
         // Embedded, the SHELL owns emptiness (it falls back to the surface
@@ -1435,6 +1457,7 @@ impl TerminalPanel {
     fn render_tab_bar(&mut self, chat: &str, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = Theme::of(cx).clone();
         let tabs = self.chats.get(chat);
+        let side_by_side = tabs.is_some_and(|tabs| tabs.side_by_side);
         let (active, count) = tabs.map(|t| (t.active, t.tabs.len())).unwrap_or((0, 0));
         let drag = self
             .drag
@@ -1443,6 +1466,7 @@ impl TerminalPanel {
         let chat_owned = chat.to_string();
 
         let tab_elements: Vec<_> = tabs
+            .filter(|tabs| tabs.tabs.len() > 1)
             .map(|tabs| {
                 tabs.tabs
                     .iter()
@@ -1542,6 +1566,7 @@ impl TerminalPanel {
                             );
                         let tab_el = div()
                             .id(("terminal-tab", key))
+                            .debug_selector(move || format!("terminal-tab-{key}"))
                             .w(px(TAB_WIDTH))
                             .h(px(28.0))
                             .flex_none()
@@ -1649,8 +1674,79 @@ impl TerminalPanel {
                             .text_color(theme.text_muted.opacity(0.6)),
                     ),
             )
-            // Collapse chevron pinned right (zeron "Hide terminal" ⌘J).
             .child(div().flex_1())
+            .child(
+                div()
+                    .id("terminal-side-by-side")
+                    .role(gpui::Role::Button)
+                    .aria_label("Side by side")
+                    .aria_toggled(if side_by_side {
+                        gpui::Toggled::True
+                    } else {
+                        gpui::Toggled::False
+                    })
+                    .tab_index(0)
+                    .tooltip(crate::settings::widgets::text_tooltip(if side_by_side {
+                        "Show one terminal at a time"
+                    } else {
+                        "Show terminals side by side"
+                    }))
+                    .debug_selector(|| "terminal-side-by-side".into())
+                    .h(px(28.0))
+                    .px(px(8.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .rounded(px(8.0))
+                    .text_size(px(12.0))
+                    .text_color(theme.text_muted)
+                    .when(side_by_side, |el| el.bg(crate::theme::ink(0.08)))
+                    .hover(|el| el.bg(crate::theme::ink(0.09)))
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        let chat = this.selected_chat(cx);
+                        let tabs = this.chats.entry(chat.clone()).or_default();
+                        tabs.side_by_side = !tabs.side_by_side;
+                        if tabs.side_by_side && tabs.tabs.len() < 2 {
+                            this.open_tab(chat, cx);
+                        }
+                        this.selection_drag = None;
+                        this.selection_scroll_task = None;
+                        this.request_focus(cx);
+                    }))
+                    .child(crate::icons::icon(crate::icons::SPLIT_COLUMNS).size(px(16.0)))
+                    .child("Side by side"),
+            )
+            .when(count == 1, |el| {
+                let key = self.chats[chat].tabs[0].key;
+                let chat = chat.to_string();
+                el.child(
+                    div()
+                        .id("terminal-close")
+                        .role(gpui::Role::Button)
+                        .aria_label("Close terminal")
+                        .tab_index(0)
+                        .tooltip(crate::settings::widgets::text_tooltip("Close terminal"))
+                        .size(px(28.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(8.0))
+                        .cursor_pointer()
+                        .hover(|el| el.bg(crate::theme::ink(0.09)))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.close_tab(&chat, key, window, cx);
+                        }))
+                        .child(
+                            crate::icons::icon(crate::icons::CLOSE)
+                                .size(px(12.0))
+                                .text_color(theme.text_muted),
+                        ),
+                )
+            })
+            // Collapse chevron pinned right (zeron "Hide terminal" ⌘J).
             .child(
                 div()
                     .id("terminal-collapse")
@@ -1741,7 +1837,66 @@ impl Render for TerminalPanel {
             window.focus(&self.focus_handle, cx);
         }
         let focused = self.focus_handle.is_focused(window);
-        let scrollbar = self.render_scrollbar(&theme, cx);
+        let visible_tabs: Vec<_> = self
+            .chats
+            .get(&chat)
+            .map(|tabs| {
+                tabs.tabs
+                    .iter()
+                    .enumerate()
+                    .filter(|(ix, _)| (!self.embedded && tabs.side_by_side) || *ix == tabs.active)
+                    .map(|(ix, tab)| (tab.key, ix == tabs.active))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let panes: Vec<_> = visible_tabs
+            .into_iter()
+            .enumerate()
+            .map(|(ix, (key, active))| {
+                // ponytail: one draggable rail follows the active pane; move rail
+                // state into each tab if simultaneous rails are needed.
+                let scrollbar = active.then(|| self.render_scrollbar(&theme, cx)).flatten();
+                div()
+                    .id(("terminal-pane", key))
+                    .debug_selector(move || format!("terminal-pane-{key}"))
+                    .relative()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .overflow_hidden()
+                    .when(ix > 0, |el| el.border_l_1().border_color(theme.border))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event, window, cx| {
+                            this.select_tab_by_key(key, cx);
+                            this.on_mouse_down(event, window, cx);
+                        }),
+                    )
+                    .on_scroll_wheel(cx.listener(
+                        move |this, event: &gpui::ScrollWheelEvent, _, cx| {
+                            let chat = this.selected_chat(cx);
+                            let Some(tab) = this.tab_mut(&chat, key) else {
+                                return;
+                            };
+                            let lines = match event.delta {
+                                ScrollDelta::Lines(delta) => delta.y,
+                                ScrollDelta::Pixels(delta) => {
+                                    let line_h = tab
+                                        .geometry
+                                        .map(|g| g.line_h)
+                                        .unwrap_or(super::view::TERM_LINE_HEIGHT);
+                                    f32::from(delta.y) / line_h
+                                }
+                            };
+                            tab.emulator.scroll(lines.round() as i32);
+                            cx.notify();
+                            cx.stop_propagation();
+                        },
+                    ))
+                    .child(TerminalElement::new(cx.entity(), key, focused && active))
+                    .children(scrollbar)
+            })
+            .collect();
 
         // Embedded (right-pane surface host): the shell's surface tabs
         // replace the internal bar.
@@ -1768,7 +1923,6 @@ impl Render for TerminalPanel {
                     .track_focus(&self.focus_handle)
                     .on_hover(cx.listener(Self::on_terminal_hover))
                     .on_key_down(cx.listener(Self::on_key_down))
-                    .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
                     .on_mouse_move(cx.listener(Self::on_mouse_move))
                     // Bound on the window, not the element: a drag that ends
                     // outside the panel still has to end the gesture, or the
@@ -1776,25 +1930,8 @@ impl Render for TerminalPanel {
                     // the user let go of.
                     .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
-                    .on_scroll_wheel(cx.listener(|this, event: &gpui::ScrollWheelEvent, _, cx| {
-                        let lines = match event.delta {
-                            ScrollDelta::Lines(delta) => delta.y,
-                            // Against the measured row height, not the default:
-                            // a user-chosen font size changes how many lines a
-                            // pixel delta covers.
-                            ScrollDelta::Pixels(delta) => {
-                                let line_h = this
-                                    .geometry
-                                    .map(|g| g.line_h)
-                                    .unwrap_or(super::view::TERM_LINE_HEIGHT);
-                                f32::from(delta.y) / line_h
-                            }
-                        };
-                        let step = lines.round() as i32;
-                        this.scroll_active(step, cx);
-                    }))
-                    .child(TerminalElement::new(cx.entity(), focused))
-                    .children(scrollbar),
+                    .flex()
+                    .children(panes),
             )
             .into_any_element()
     }
@@ -1803,6 +1940,135 @@ impl Render for TerminalPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn side_by_side_terminals_keep_grids_input_and_lifecycle_independent(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::AppContext;
+
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+        });
+        let (panel, cx) = cx.add_window_view(|_, cx| {
+            let state = cx.new(|_| {
+                let mut state = AppState::new();
+                state.selected_chat = Some("chat".into());
+                state
+            });
+            let mut panel = TerminalPanel::new(state, cx);
+            panel.open = true;
+            panel.reserve_tab_for_chat("chat".into(), "First", cx);
+            panel
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        assert!(cx.debug_bounds("terminal-tab-1").is_none());
+        let full_width = cx.debug_bounds("terminal-pane-1").unwrap().size.width;
+
+        panel.update(cx, |panel, cx| {
+            panel.reserve_tab_for_chat("chat".into(), "Second", cx);
+            for key in [1, 2] {
+                let tab = panel.tab_mut("chat", key).unwrap();
+                for _ in 0..200 {
+                    tab.emulator.feed(b"scrollback\r\n");
+                }
+            }
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        assert!(cx.debug_bounds("terminal-tab-1").is_some());
+        assert!(cx.debug_bounds("terminal-tab-2").is_some());
+        assert!(cx.debug_bounds("terminal-pane-1").is_none());
+        let toggle = cx.debug_bounds("terminal-side-by-side").unwrap().center();
+        cx.simulate_click(toggle, gpui::Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear());
+        let left = cx.debug_bounds("terminal-pane-1").unwrap();
+        let right = cx.debug_bounds("terminal-pane-2").unwrap();
+        assert!(left.right() <= right.left());
+        assert!((f32::from(left.size.width - right.size.width)).abs() <= 1.0);
+        assert!(left.size.width < full_width);
+        panel.read_with(cx, |panel, _| {
+            let tabs = &panel.chats["chat"];
+            assert!(tabs.side_by_side);
+            for tab in &tabs.tabs {
+                let geometry = tab.geometry.unwrap();
+                assert_eq!(tab.emulator.cols(), geometry.cols as usize);
+                assert!(geometry.bounds.size.width < full_width);
+            }
+        });
+
+        // A wheel over the unfocused pane scrolls only that pane.
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: left.center(),
+            delta: ScrollDelta::Lines(gpui::point(0.0, 3.0)),
+            modifiers: Default::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        panel.read_with(cx, |panel, _| {
+            let tabs = &panel.chats["chat"];
+            assert_eq!(tabs.active, 1);
+            assert_eq!(tabs.tabs[0].emulator.display_offset(), 3);
+            assert_eq!(tabs.tabs[1].emulator.display_offset(), 0);
+        });
+        cx.simulate_click(left.center(), gpui::Modifiers::default());
+        cx.simulate_keystrokes("a");
+        cx.simulate_click(right.center(), gpui::Modifiers::default());
+        cx.simulate_keystrokes("b");
+        panel.update(cx, |panel, _| {
+            let tabs = panel.chats.get_mut("chat").unwrap();
+            assert_eq!(tabs.tabs[0].coalescer.take(), b"a");
+            assert_eq!(tabs.tabs[1].coalescer.take(), b"b");
+            assert_eq!(tabs.active, 1);
+        });
+
+        // Reordering follows stable keys; hiding the split keeps both sessions.
+        panel.update(cx, |panel, cx| panel.commit_reorder("chat", 0, 1, cx));
+        cx.update(|window, cx| window.draw(cx).clear());
+        assert!(
+            cx.debug_bounds("terminal-pane-2").unwrap().left()
+                < cx.debug_bounds("terminal-pane-1").unwrap().left()
+        );
+        cx.simulate_click(toggle, gpui::Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear());
+        assert!(cx.debug_bounds("terminal-pane-1").is_none());
+        assert_eq!(
+            cx.debug_bounds("terminal-pane-2").unwrap().size.width,
+            full_width
+        );
+        cx.simulate_click(toggle, gpui::Modifiers::default());
+
+        // Chat navigation restores the layout and terminal identities.
+        let state = panel.read_with(cx, |panel, _| panel.state.clone());
+        state.update(cx, |state, cx| {
+            state.selected_chat = Some("other".into());
+            cx.notify();
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        assert!(cx.debug_bounds("terminal-pane-1").is_none());
+        state.update(cx, |state, cx| {
+            state.selected_chat = Some("chat".into());
+            cx.notify();
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        assert!(cx.debug_bounds("terminal-pane-1").is_some());
+        assert!(cx.debug_bounds("terminal-pane-2").is_some());
+
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| panel.close_tab_by_key(2, window, cx));
+            window.draw(cx).clear();
+        });
+        assert!(cx.debug_bounds("terminal-tab-1").is_none());
+        assert!(cx.debug_bounds("terminal-tab-2").is_none());
+        assert!(cx.debug_bounds("terminal-pane-2").is_none());
+        assert_eq!(
+            cx.debug_bounds("terminal-pane-1").unwrap().size.width,
+            full_width
+        );
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.chats["chat"].tabs.len(), 1);
+            assert_eq!(panel.chats["chat"].active, 0);
+        });
+    }
 
     #[test]
     fn height_clamps_between_160_and_55vh() {

@@ -353,18 +353,23 @@ impl InputCoalescer {
 // Grid element
 // ---------------------------------------------------------------------------
 
-/// Paints the active tab's grid. Cell metrics come from the resolved mono font
+/// Paints one tab's grid. Cell metrics come from the resolved mono font
 /// each frame (font probe): `em_advance` for the cell width, the fixed line
 /// height for rows. The measured cols×rows feed back into the panel, which
 /// resizes the emulator immediately and debounces the `ResizeTerminal` RPC.
 pub struct TerminalElement {
     panel: Entity<TerminalPanel>,
+    key: u64,
     focused: bool,
 }
 
 impl TerminalElement {
-    pub fn new(panel: Entity<TerminalPanel>, focused: bool) -> Self {
-        Self { panel, focused }
+    pub fn new(panel: Entity<TerminalPanel>, key: u64, focused: bool) -> Self {
+        Self {
+            panel,
+            key,
+            focused,
+        }
     }
 }
 
@@ -465,6 +470,7 @@ impl gpui::Element for TerminalElement {
         );
         let snapshot = self.panel.update(cx, |panel, cx| {
             panel.on_grid_metrics(
+                self.key,
                 super::panel::GridGeometry {
                     bounds,
                     origin,
@@ -475,7 +481,7 @@ impl gpui::Element for TerminalElement {
                 },
                 cx,
             );
-            panel.active_grid_snapshot(cx)
+            panel.grid_snapshot(self.key, cx)
         });
         let Some(snapshot) = snapshot else {
             return TerminalPrepaint {
