@@ -953,6 +953,12 @@ pub fn set_pause_in_background(enabled: bool, cx: &mut App) {
 /// changing it means visiting System Settings, so coming back is the moment
 /// it can have moved, without holding a platform notification observer.
 pub fn window_activation_changed(active: bool, cx: &mut App) {
+    // Only the app installs motion state. Test windows activate too, and the
+    // Linux portal read would wake the deterministic scheduler from a D-Bus
+    // thread.
+    if !cx.has_global::<MotionState>() {
+        return;
+    }
     if active {
         refresh_system(cx);
     }
